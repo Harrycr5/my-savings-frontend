@@ -15,6 +15,19 @@ import { AuthContext } from "@/lib/auth-context"
 
 const SESSION_STORAGE_KEY = "my-savings-session"
 
+type ActiveSession = {
+  tokens: TokenResponse
+  identity: symbol
+}
+
+function refreshTokens(refreshToken: string): Promise<TokenResponse> {
+  return apiRequest<TokenResponse>("auth/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  })
+}
+
 function isTokenResponse(value: unknown): value is TokenResponse {
   if (typeof value !== "object" || value === null) return false
   const session = value as Partial<TokenResponse>
@@ -45,11 +58,16 @@ function readStoredSession(): TokenResponse | null {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSessionState] = useState<TokenResponse | null>(readStoredSession)
-  const sessionRef = useRef<TokenResponse | null>(session)
-  const refreshPromise = useRef<Promise<TokenResponse> | null>(null)
+  const [initialIdentity] = useState(() => Symbol())
+  const sessionRef = useRef<ActiveSession | null>(
+    session && { tokens: session, identity: initialIdentity },
+  )
+  const refreshPromise = useRef<{
+    session: ActiveSession
+    promise: Promise<TokenResponse>
+  } | null>(null)
 
-  const setSession = useCallback((nextSession: TokenResponse | null) => {
-    sessionRef.current = nextSession
+  const persistSession = useCallback((nextSession: TokenResponse | null) => {
     setSessionState(nextSession)
     if (nextSession) {
       window.sessionStorage.setItem(
@@ -61,13 +79,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const setSession = useCallback((tokens: TokenResponse | null, identity = Symbol()) => {
+    sessionRef.current = tokens && { tokens, identity }
+    persistSession(tokens)
+  }, [persistSession])
+
   const updateUser = useCallback((user: UserSession) => {
     const activeSession = sessionRef.current
     if (!activeSession) {
       throw new Error("No hay una sesión activa para actualizar.")
     }
-    setSession({ ...activeSession, user })
-  }, [setSession])
+    activeSession.tokens = { ...activeSession.tokens, user }
+    persistSession(activeSession.tokens)
+  }, [persistSession])
 
   const signIn = useCallback(async (username: string, password: string) => {
     const body = new URLSearchParams({ username, password })
@@ -98,48 +122,69 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
 
     try {
-      return await apiRequest<T>(path, init, activeSession.access_token)
+      return await apiRequest<T>(path, init, activeSession.tokens.access_token)
     } catch (error) {
       if (!(error instanceof ApiError) || error.status !== 401) {
         throw error
       }
-    }
 
-    const refresh = refreshPromise.current ?? apiRequest<TokenResponse>(
-      "auth/refresh",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          refresh_token: activeSession.refresh_token,
-        }),
-      },
-    )
-    refreshPromise.current = refresh
+      if (sessionRef.current?.identity !== activeSession.identity) throw error
 
-    try {
-      const refreshedSession = await refresh
-      setSession(refreshedSession)
-      return await apiRequest<T>(path, init, refreshedSession.access_token)
-    } catch (error) {
-      setSession(null)
-      throw error
-    } finally {
-      if (refreshPromise.current === refresh) {
-        refreshPromise.current = null
+      if (sessionRef.current === activeSession) {
+        if (refreshPromise.current?.session !== activeSession) {
+          const promise = refreshTokens(activeSession.tokens.refresh_token).then((tokens) => {
+            if (sessionRef.current === activeSession) {
+              setSession(tokens, activeSession.identity)
+            }
+            return tokens
+          }).catch((refreshError: unknown) => {
+            if (sessionRef.current === activeSession) setSession(null)
+            throw refreshError
+          }).finally(() => {
+            if (refreshPromise.current?.session === activeSession) {
+              refreshPromise.current = null
+            }
+          })
+          refreshPromise.current = { session: activeSession, promise }
+        }
+        await refreshPromise.current.promise
+      }
+
+      const retrySession = sessionRef.current
+      if (retrySession?.identity !== activeSession.identity) throw error
+
+      try {
+        return await apiRequest<T>(path, init, retrySession.tokens.access_token)
+      } catch (retryError) {
+        if (retryError instanceof ApiError && retryError.status === 401 &&
+          sessionRef.current === retrySession) {
+          setSession(null)
+        }
+        throw retryError
       }
     }
   }, [setSession])
 
   const signOut = useCallback(async () => {
+    const activeSession = sessionRef.current
+    const pendingRefresh = refreshPromise.current?.session === activeSession
+      ? refreshPromise.current.promise
+      : undefined
+    setSession(null)
+    if (!activeSession) return
+
+    const logout = (accessToken: string) =>
+      apiRequest<ApiResponse<null>>("auth/logout", { method: "POST" }, accessToken)
+
     try {
-      if (sessionRef.current) {
-        await request<ApiResponse<null>>("auth/logout", { method: "POST" })
-      }
-    } finally {
-      setSession(null)
+      await logout(activeSession.tokens.access_token)
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 401) throw error
+
+      const tokens = await (pendingRefresh ?? refreshTokens(activeSession.tokens.refresh_token))
+      await logout(tokens.access_token)
     }
-  }, [request, setSession])
+  }, [setSession])
 
   return (
     <AuthContext.Provider
